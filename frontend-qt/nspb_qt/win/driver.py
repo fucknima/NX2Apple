@@ -590,7 +590,7 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
 
     def capture_nro(py_=None, repo_=None, exe_dir=None, out=None, nro_dir=None,
                     env=None, logs=None, g=None, provisional=False, *a, **kw):
-        """Return `g` when no runtime NRO is missing, or refuse when `missing.tsv` is non-empty."""
+        """Return `g` when no runtime NRO is missing, decode `nxboot` NROs offline, or refuse."""
         if nro_dir is not None:
             missing = Path(nro_dir) / 'missing.tsv'
             if not missing.is_file():
@@ -602,6 +602,33 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
             )
             if not want:
                 return g
+            if exe_dir is not None and (Path(exe_dir) / 'main').is_file():
+                from . import nro_emu
+                if hasattr(mod.PROG, 'add'):
+                    mod.PROG.add(2)
+                mod.PROG.stage('NRO capture')
+                mod.PROG.set(step='decoding runtime NRO offline')
+                try:
+                    captured = nro_emu.capture_missing_nros(exe_dir, nro_dir, say=say)
+                except Exception as exc:
+                    say(f'offline NRO decode failed ({exc})')
+                    captured = []
+                rem = (
+                    [
+                        ln
+                        for ln in missing.read_text(encoding='utf-8', errors='replace').splitlines()
+                        if ln and '\t' in ln
+                    ]
+                    if missing.is_file()
+                    else []
+                )
+                if captured and not rem:
+                    name, _sha, sz = captured[-1]
+                    mod.PROG.end(f'{name}, {sz / 2**20:.1f} MB')
+                    if hasattr(mod, 'rewrite') and out is not None:
+                        return mod.rewrite(py_, repo_, exe_dir, out, env, logs, g, provisional)
+                    return g
+                mod.PROG.end(ok=False)
         _refuse_capture('this game (runtime NRO)')()
 
     mod.capture_nro = capture_nro

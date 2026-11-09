@@ -1762,7 +1762,8 @@ class PlatformIsolationTest(unittest.TestCase):
             code = (
                 'import sys; sys.path.insert(0, %r)\n'
                 'from nspb_qt.win import toolchain, sdk_fetch, shim, fix_ipa_modes, fetch, '
-                'doctor, build_app, driver, xcrun_shim, macho_sign, sdk_auto_cuts\n'
+                'doctor, build_app, driver, xcrun_shim, macho_sign, sdk_auto_cuts, '
+                'arm64_emu, gm_shaders, nro_emu\n'
                 'print("ok")\n'
             ) % str(QT)
             r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
@@ -4802,6 +4803,15 @@ class GMShadersAndCaptureReuseTest(unittest.TestCase):
             with self.assertRaises(gm_shaders.GMShaderError):
                 gm_shaders.shdr_chunk_shaders(bad)
 
+            # 6. Runner table with fewer than 3 VS templates raises GMShaderError
+            truncated_gm = _make_fake_gm_main().replace(
+                b'attribute vec3 in_Position;\nattribute LOWPREC vec4 in_Colour;\n'
+                b'void main() { gl_Position = vec4(in_Position, 1.0); }\n\x00',
+                b'',
+            )
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.runner_builtins(truncated_gm)
+
     def test_driver_capture_hooks_reconstruct_and_reuse(self) -> None:
         from nspb_qt.win import driver, gm_shaders
 
@@ -4929,6 +4939,247 @@ class GMShadersAndCaptureReuseTest(unittest.TestCase):
             (nro_dir / 'missing.tsv').write_text('deadbeef\tnro0\n', encoding='utf-8')
             with self.assertRaises(mod.BuildError):
                 mod.capture_nro(sys.executable, repo, None, None, nro_dir, {}, root, prof, False)
+
+    def test_nxboot_offline_nro_decode_and_driver_capture_nro(self) -> None:
+        """Verify `nro_emu.decode_boot_nro` and `driver.capture_nro` decode `nxboot` NROs in Unicorn."""
+        from nspb_qt.win import arm64_emu as E
+        from nspb_qt.win import driver, nro_emu
+
+        self.assertTrue(E._HAS_UNICORN, 'unicorn is required for offline NRO tests')
+
+        # Build a synthetic ARM64 `nxboot` NSO with `pacibsp` / `retab` instructions:
+        # - PLT stubs at 0x200..0x240 jump via GOT slots in .data (0x2000..0x2020):
+        #     0x200 -> _ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii (GOT 0x2000)
+        #     0x210 -> _ZN2nn2ro10InitializeEv (GOT 0x2008)
+        #     0x220 -> _ZN2nn2os12AwaitBarrierEPNS0_11BarrierTypeE (GOT 0x2010)
+        #     0x230 -> malloc (GOT 0x2018)
+        # - `nnMain` at 0x020: calls `CreateThread(0, base+0x060, ...)`, `CreateThread(0, base+0x100, ...)`,
+        #   then `nn::ro::Initialize()`, and returns with `retab` (0xD65F0FFF).
+        # - Worker 0 at 0x060: writes `sizes[0] = 0x80`, calls `AwaitBarrier`, sums `sizes[0] + sizes[1]`,
+        #   calls `malloc(total)` and stores to `*out_buf_ptr`, calls `AwaitBarrier`, writes `NRO0` at +0x10
+        #   and `0x100` (256 bytes) at +0x18, and returns with `retab`.
+        # - Worker 1 at 0x100: writes `sizes[1] = 0x80`, calls `AwaitBarrier`, calls `AwaitBarrier`,
+        #   writes `0xCAFEBABE` at `(*out_buf_ptr) + sizes[0]`, and returns with `retab`.
+        text = bytearray(0x1000)
+
+        def put_insns(off: int, words: list[int]) -> None:
+            struct.pack_into(f'<{len(words)}I', text, off, *words)
+
+        def bl_at(pc: int, target: int) -> int:
+            return 0x94000000 | (((target - pc) // 4) & 0x3FFFFFF)
+
+        def adr_x1(pc: int, target: int) -> int:
+            delta = target - pc
+            return 0x10000001 | ((delta & 3) << 29) | (((delta >> 2) & 0x7FFFF) << 5)
+
+        # PLT stubs at 0x200, 0x210, 0x220, 0x230 (adrp x16, #0x2000; ldr x17, [x16, #slot]; br x17)
+        for idx, slot_off in enumerate((0x00, 0x08, 0x10, 0x18)):
+            ldr_imm = (slot_off // 8) << 10
+            put_insns(
+                0x200 + idx * 0x10,
+                [
+                    0xD0000010,                 # adrp x16, #0x2000
+                    0xF9400211 | ldr_imm,       # ldr x17, [x16, #slot_off]
+                    0xD61F0220,                 # br x17
+                    0xD503201F,                 # nop
+                ],
+            )
+
+        # nnMain at 0x020
+        put_insns(
+            0x020,
+            [
+                0xD503237F,                     # 0x020: pacibsp
+                0xA9BF7BFD,                     # 0x024: stp x29, x30, [sp, #-16]!
+                adr_x1(0x028, 0x060),           # 0x028: adr x1, 0x060 (worker 0)
+                bl_at(0x02C, 0x200),            # 0x02c: bl 0x200 (CreateThread)
+                adr_x1(0x030, 0x100),           # 0x030: adr x1, 0x100 (worker 1)
+                bl_at(0x034, 0x200),            # 0x034: bl 0x200 (CreateThread)
+                bl_at(0x038, 0x210),            # 0x038: bl 0x210 (ro::Initialize)
+                0xA8C17BFD,                     # 0x03c: ldp x29, x30, [sp], #16
+                0xD65F0FFF,                     # 0x040: retab
+            ],
+        )
+
+        # Worker 0 at 0x060
+        put_insns(
+            0x060,
+            [
+                0xD503237F,                     # 0x060: pacibsp
+                0xA9BD7BFD,                     # 0x064: stp x29, x30, [sp, #-48]!
+                0xA90153F3,                     # 0x068: stp x19, x20, [sp, #16]
+                0xA9402013,                     # 0x06c: ldp x19, x8, [x0] (x19=out_buf_ptr, x8=sizes_holder)
+                0xF9400114,                     # 0x070: ldr x20, [x8] (x20=sizes_arr)
+                0x52801008,                     # 0x074: mov w8, #0x80
+                0xB9000288,                     # 0x078: str w8, [x20]
+                bl_at(0x07C, 0x220),            # 0x07c: bl 0x220 (AwaitBarrier 1)
+                0x29402688,                     # 0x080: ldp w8, w9, [x20]
+                0x0B090100,                     # 0x084: add w0, w8, w9
+                bl_at(0x088, 0x230),            # 0x088: bl 0x230 (malloc)
+                0xF9000260,                     # 0x08c: str x0, [x19]
+                bl_at(0x090, 0x220),            # 0x090: bl 0x220 (AwaitBarrier 2)
+                0xF9400268,                     # 0x094: ldr x8, [x19]
+                0xB40000C8,                     # 0x098: cbz x8, 0x0b0
+                0x528A49C9,                     # 0x09c: mov w9, #0x524e ('NR' little-endian)
+                0x72A609E9,                     # 0x0a0: movk w9, #0x304f, lsl #16 ('NRO0')
+                0xB9001109,                     # 0x0a4: str w9, [x8, #0x10]
+                0x52802009,                     # 0x0a8: mov w9, #0x100
+                0xB9001909,                     # 0x0ac: str w9, [x8, #0x18]
+                0xA94153F3,                     # 0x0b0: ldp x19, x20, [sp, #16]
+                0xA8C37BFD,                     # 0x0b4: ldp x29, x30, [sp], #48
+                0xD65F0FFF,                     # 0x0b8: retab
+            ],
+        )
+
+        # Worker 1 at 0x100
+        put_insns(
+            0x100,
+            [
+                0xD503237F,                     # 0x100: pacibsp
+                0xA9BD7BFD,                     # 0x104: stp x29, x30, [sp, #-48]!
+                0xA90153F3,                     # 0x108: stp x19, x20, [sp, #16]
+                0xA9402013,                     # 0x10c: ldp x19, x8, [x0]
+                0xF9400114,                     # 0x110: ldr x20, [x8]
+                0x52801008,                     # 0x114: mov w8, #0x80
+                0xB9000688,                     # 0x118: str w8, [x20, #4]
+                bl_at(0x11C, 0x220),            # 0x11c: bl 0x220 (AwaitBarrier 1)
+                bl_at(0x120, 0x220),            # 0x120: bl 0x220 (AwaitBarrier 2)
+                0xF9400268,                     # 0x124: ldr x8, [x19]
+                0xB9800289,                     # 0x128: ldrsw x9, [x20]
+                0x8B090108,                     # 0x12c: add x8, x8, x9
+                0x529757C9,                     # 0x130: mov w9, #0xbabe
+                0x72B95FC9,                     # 0x134: movk w9, #0xcafe, lsl #16
+                0xB9000109,                     # 0x138: str w9, [x8]
+                0xA94153F3,                     # 0x13c: ldp x19, x20, [sp, #16]
+                0xA8C37BFD,                     # 0x140: ldp x29, x30, [sp], #48
+                0xD65F0FFF,                     # 0x144: retab
+            ],
+        )
+
+        # Build .rodata (at 0x1000) with MOD0, dynamic table, strtab, symtab, jmprel
+        ro = bytearray(0x1000)
+        struct.pack_into('<I', text, 4, 0x1000)  # mod0 offset at image+4
+        struct.pack_into('<4sii', ro, 0, b'MOD0', 0x20, 0x2000)  # dynamic at 0x1020
+
+        strtab = bytearray(b'\x00')
+        syms = bytearray(24)  # symbol 0 (STN_UNDEF)
+
+        def add_sym(name: str, shndx: int, val: int) -> int:
+            idx = len(syms) // 24
+            name_off = len(strtab)
+            strtab.extend(name.encode('ascii') + b'\x00')
+            info = (1 << 4) | 2
+            syms.extend(struct.pack('<IBBHQQ', name_off, info, 0, shndx, val, 0))
+            return idx
+
+        add_sym('nnMain', 1, 0x020)
+        s_create = add_sym('_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii', 0, 0)
+        s_ro_init = add_sym('_ZN2nn2ro10InitializeEv', 0, 0)
+        s_barrier = add_sym('_ZN2nn2os12AwaitBarrierEPNS0_11BarrierTypeE', 0, 0)
+        s_malloc = add_sym('malloc', 0, 0)
+
+        jmprel = bytearray()
+        for slot_off, sym_i in ((0x00, s_create), (0x08, s_ro_init), (0x10, s_barrier), (0x18, s_malloc)):
+            jmprel.extend(struct.pack('<QQq', 0x2000 + slot_off, (sym_i << 32) | 1026, 0))
+
+        symtab_off = 0x1200
+        strtab_off = symtab_off + len(syms)
+        jmprel_off = 0x1600
+        ro[symtab_off - 0x1000:symtab_off - 0x1000 + len(syms)] = syms
+        ro[strtab_off - 0x1000:strtab_off - 0x1000 + len(strtab)] = strtab
+        ro[jmprel_off - 0x1000:jmprel_off - 0x1000 + len(jmprel)] = jmprel
+
+        dyn_entries = [
+            (5, strtab_off),
+            (6, symtab_off),
+            (10, len(strtab)),
+            (11, 24),
+            (23, jmprel_off),
+            (2, len(jmprel)),
+            (0, 0),
+        ]
+        for i, (tag, val) in enumerate(dyn_entries):
+            struct.pack_into('<QQ', ro, 0x20 + i * 16, tag, val)
+
+        data = bytearray(0x1000)
+        hdr = bytearray(0x100)
+        hdr[:4] = b'NSO0'
+        struct.pack_into('<III', hdr, 0x10, 0x100, 0x0, len(text))
+        struct.pack_into('<III', hdr, 0x20, 0x100 + len(text), 0x1000, len(ro))
+        struct.pack_into('<III', hdr, 0x30, 0x100 + len(text) + len(ro), 0x2000, len(data))
+        struct.pack_into('<I', hdr, 0x3C, 0x100)
+        struct.pack_into('<III', hdr, 0x60, len(text), len(ro), len(data))
+        nso_blob = bytes(hdr + text + ro + data)
+
+        expected_nro = bytearray(0x100)
+        expected_nro[0x10:0x14] = b'NRO0'
+        struct.pack_into('<I', expected_nro, 0x18, 0x100)
+        struct.pack_into('<I', expected_nro, 0x80, 0xCAFEBABE)
+        expected_sha = __import__('hashlib').sha256(expected_nro).hexdigest()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            exe_dir = root / 'ExeFS'
+            exe_dir.mkdir()
+            main_path = exe_dir / 'main'
+            main_path.write_bytes(nso_blob)
+
+            decoded = nro_emu.decode_boot_nro(main_path, max_workers=2)
+            self.assertEqual(decoded, bytes(expected_nro))
+
+            # Non-nxboot NSO without AwaitBarrier/CreateThread imports is rejected before running nnMain
+            non_nxboot = nso_blob.replace(
+                b'_ZN2nn2os12AwaitBarrierEPNS0_11BarrierTypeE',
+                b'_ZN2nn2os12OtherSymbolEPNS0_11BarrierTypeE_',
+            )
+            non_nxboot_path = exe_dir / 'plain_main'
+            non_nxboot_path.write_bytes(non_nxboot)
+            with mock.patch.object(nro_emu._BootNroMachine, 'call') as m_call:
+                with self.assertRaises(E.EmuError):
+                    nro_emu.decode_boot_nro(non_nxboot_path)
+                m_call.assert_not_called()
+
+            # Verify driver.capture_nro decodes offline, updates nro.tsv/missing.tsv, and triggers rewrite
+            repo = QT.parent / 'engine'
+            if (repo / 'scripts/build_ipa_from_nsp.py').is_file():
+                mod = driver.load_upstream(repo)
+                driver.patch(mod, repo)
+                nro_dir = root / 'nro_v0'
+                nro_dir.mkdir()
+                (nro_dir / 'missing.tsv').write_text(f'{expected_sha}\tnrr.nrr\n', encoding='utf-8')
+                (nro_dir / 'nro.tsv').write_text('# name\tsha256\tsize\tnrr\twhere\n', encoding='utf-8')
+                rewrite_calls: list[Path] = []
+                orig_rewrite = mod.rewrite
+
+                def fake_rewrite(py_, repo_, ed, out_, env_, logs_, g_, prov_=False, *a, **kw):
+                    rewrite_calls.append(Path(out_))
+                    return g_
+
+                try:
+                    mod.rewrite = fake_rewrite
+                    sentinel_g = object()
+                    res = mod.capture_nro(
+                        sys.executable,
+                        repo,
+                        exe_dir,
+                        root / 'patched_v0',
+                        nro_dir,
+                        {},
+                        root,
+                        sentinel_g,
+                        False,
+                    )
+                finally:
+                    mod.rewrite = orig_rewrite
+
+                self.assertIs(res, sentinel_g)
+                self.assertEqual(rewrite_calls, [root / 'patched_v0'])
+                self.assertEqual((nro_dir / 'nro0.nro').read_bytes(), bytes(expected_nro))
+                self.assertEqual((nro_dir / 'missing.tsv').read_text(encoding='utf-8'), '')
+                self.assertIn(
+                    f'nro0\t{expected_sha}\t256\tnrr.nrr\tcapture',
+                    (nro_dir / 'nro.tsv').read_text(encoding='utf-8'),
+                )
 
 
 if __name__ == '__main__':

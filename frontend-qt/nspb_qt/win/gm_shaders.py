@@ -104,7 +104,10 @@ def nso_image(path: str | Path) -> bytes:
                 raw = zbic.decompress(raw)
             else:
                 import lz4.block
-                raw = lz4.block.decompress(raw, uncompressed_size=sz)
+                try:
+                    raw = lz4.block.decompress(raw, uncompressed_size=sz)
+                except lz4.block.LZ4BlockError as e:
+                    raise GMShaderError(f'{path}: corrupted LZ4 NSO segment {i}') from e
         if len(raw) != sz:
             raise GMShaderError(f'{path}: NSO segment {i} decompressed to {len(raw):#x}, expected {sz:#x}')
         img[mo:mo + sz] = raw
@@ -152,8 +155,10 @@ def runner_builtins(main_img: bytes) -> list[tuple[str, bytes, str]] | None:
             break
         s, pos = _read_cstr(main_img, pos)
         vs_templates.append(s)
-    if not vs_templates:
-        raise GMShaderError('GameMaker vertex shader templates not found in ExeFS/main')
+    if len(vs_templates) < 3:
+        raise GMShaderError(
+            f'GameMaker vertex shader templates incomplete ({len(vs_templates)}/3) in ExeFS/main'
+        )
 
     pos = _skip_padding(main_img, pos)
     if not main_img[pos:pos + len(_FS_PREC_SIG)].startswith(_FS_PREC_SIG):
@@ -172,8 +177,10 @@ def runner_builtins(main_img: bytes) -> list[tuple[str, bytes, str]] | None:
             break
         s, pos = _read_cstr(main_img, pos)
         fs_templates.append(s)
-    if not fs_templates:
-        raise GMShaderError('GameMaker fragment shader templates not found in ExeFS/main')
+    if len(fs_templates) < 2:
+        raise GMShaderError(
+            f'GameMaker fragment shader templates incomplete ({len(fs_templates)}/2) in ExeFS/main'
+        )
 
     out: list[tuple[str, bytes, str]] = []
     light_defs = (
@@ -298,7 +305,7 @@ def generate(
     if table and Path(table).is_file():
         want = {
             line.strip()
-            for line in Path(table).read_text(encoding='utf-8').splitlines()
+            for line in Path(table).read_text(encoding='utf-8', errors='replace').splitlines()
             if line.strip() and not line.startswith('#')
         }
     if require_table and not want:
@@ -342,8 +349,15 @@ def generate(
 
     out_dir = Path(out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    pid = os.getpid()
     for name, raw in encoded.items():
-        (out_dir / name).write_bytes(raw)
+        dst = out_dir / name
+        tmp = out_dir / f'{name}.tmp.{pid}'
+        try:
+            tmp.write_bytes(raw)
+            os.replace(tmp, dst)
+        finally:
+            tmp.unlink(missing_ok=True)
     return made, want
 
 
