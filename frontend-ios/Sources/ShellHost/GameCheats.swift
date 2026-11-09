@@ -1,4 +1,4 @@
-import Foundation
+﻿import Foundation
 import os
 import ShellUI
 
@@ -48,10 +48,10 @@ public enum GameCheats {
 
     /// Copies the cheat files the app ships for `gameID` into the game's folder. An existing file is never overwritten, so
     /// a file the player updated stays. Missing folders are created.
-    public static func install(gameID: String, appFolder: URL, bundle: Bundle = .module) {
+    public static func install(gameID: String, appFolder: URL, bundle: Bundle? = nil) {
         let fm = FileManager.default
         let dest = folder(for: appFolder)
-        let shipped = shippedFiles(gameID: gameID, bundle: bundle)
+        let shipped = shippedFiles(gameID: gameID, bundle: bundle ?? .module)
         guard !shipped.isEmpty else { return }
         do {
             try fm.createDirectory(at: dest, withIntermediateDirectories: true)
@@ -114,7 +114,7 @@ public enum GameCheats {
 
     /// The cheats groups of one game: a row per entry, masters left out (they always run) and off halves left out (the
     /// engine runs them when the switch turns off).
-    public static func sections(gameID: String, appFolder: URL, bundle: Bundle = .module) -> [SettingSection] {
+    public static func sections(gameID: String, appFolder: URL, bundle: Bundle? = nil) -> [SettingSection] {
         install(gameID: gameID, appFolder: appFolder, bundle: bundle)
         var sections: [SettingSection] = []
         for file in files(appFolder: appFolder) {

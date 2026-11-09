@@ -118,7 +118,9 @@ def build_template(out_app: Path, engine: Path | None = None) -> Path:
         ]
         r_xb = subprocess.run(cmd, cwd=s, env=env, capture_output=True, text=True)
         if r_xb.returncode != 0:
-            tail = '\n'.join((r_xb.stdout + '\n' + r_xb.stderr).splitlines()[-40:])
+            lines = (r_xb.stdout + '\n' + r_xb.stderr).splitlines()
+            errors = [ln for ln in lines if ' error: ' in ln or ln.lstrip().startswith('error:')]
+            tail = '\n'.join(errors[-40:] if errors else lines[-60:])
             raise SystemExit(f'xcodebuild DmShell failed:\n{tail}')
 
         built = dd / 'Build' / 'Products' / 'Release-iphoneos' / 'DmShell.app'
