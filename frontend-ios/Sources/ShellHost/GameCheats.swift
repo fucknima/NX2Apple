@@ -19,8 +19,10 @@ public enum GameCheats {
 
     /// One `[Name]` or `{Name}` entry of a cheat file.
     struct Entry {
-        /// The header name exactly as the engine's `<build>.enabled` keys it.
+        /// The header name exactly as it is written in the file.
         var name: String
+        /// The key `<build>.enabled` uses: the name, or `Name #2`, `Name #3` for a repeated name.
+        var key: String
         /// `{Name}`: always on, applied first, not a switch.
         var master: Bool
         /// The name without a trailing `- on` / `- off`, so a pair shows as one switch.
@@ -121,7 +123,7 @@ public enum GameCheats {
             for (index, entry) in file.entries.enumerated() where entry.shown && !entry.master {
                 let id = "\(rowPrefix)\(file.stem)#\(index)"
                 rows.append(SettingRow(id: id, label: entry.label, kind: .toggle(on: "1", off: "0"),
-                                       value: on.contains(entry.name) ? "1" : "0"))
+                                       value: on.contains(entry.key) ? "1" : "0"))
             }
             guard !rows.isEmpty else { continue }
             sections.append(SettingSection(id: "cheats.\(file.stem)", title: "Cheats", rows: rows))
@@ -143,7 +145,7 @@ public enum GameCheats {
         guard let text = readText(url) else { return nil }
         let entries = parse(text)
         guard entries.indices.contains(index) else { return nil }
-        let key = entries[index].name
+        let key = entries[index].key
         var names = enabledNames(stem: stem, appFolder: appFolder)
         let value = names.contains(key) ? "0" : "1"
         if value == "1" {
@@ -163,13 +165,17 @@ public enum GameCheats {
     static func parse(_ text: String) -> [Entry] {
         var entries: [Entry] = []
         var current: (name: String, master: Bool, code: Int)?
+        var seen: [String: Int] = [:]
 
         func flush() {
             guard let c = current else { return }
             current = nil
             guard c.code > 0 else { return }
             let (label, half) = splitHalf(c.name)
-            entries.append(Entry(name: c.name, master: c.master, label: label, half: half, shown: half != true))
+            let dup = seen[c.name, default: 0]
+            seen[c.name] = dup + 1
+            let key = dup == 0 ? c.name : "\(c.name) #\(dup + 1)"
+            entries.append(Entry(name: c.name, key: key, master: c.master, label: label, half: half, shown: half != true))
         }
 
         for raw in text.split(whereSeparator: \.isNewline) {
