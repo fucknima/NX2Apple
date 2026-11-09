@@ -4632,5 +4632,304 @@ class WinToolchainInstallWiringTest(unittest.TestCase):
                 self.assertEqual(cenv.get('PYTHONPATH'), r'C:\UserLib')
 
 
+import struct
+
+
+def _make_fake_gm_main() -> bytes:
+    """Build a synthetic GameMaker Switch Runner rodata table matching ExeFS/main's layout."""
+    parts = [
+        b'\xff' * 16,
+        b'#define LOWPREC lowp\n\x00',
+        b'#define MATRIX_VIEW                    0                               \n'
+        b'uniform mat4 gm_Matrices[5];\n\x00',
+        b'attribute vec3 in_Position;\nattribute vec2 in_TextureCoord;\n'
+        b'attribute LOWPREC vec4 in_Colour;\nvoid main() { gl_Position = vec4(in_Position, 1.0); }\n\x00',
+        b'attribute vec3 in_Position;\nattribute vec3 in_Normal;\n'
+        b'attribute vec2 in_TextureCoord;\nvoid main() { gl_Position = vec4(in_Position + in_Normal, 1.0); }\n\x00',
+        b'attribute vec3 in_Position;\nattribute LOWPREC vec4 in_Colour;\n'
+        b'void main() { gl_Position = vec4(in_Position, 1.0); }\n\x00',
+        b'precision mediump float;\t\t\t\t\t\t\n#define HIGHPREC \n'
+        b'#define LOWPREC lowp                           \n\x00',
+        b'uniform sampler2D gm_BaseTexture;              \n'
+        b'void DoAlphaTest(LOWPREC vec4 c) {}\n\x00',
+        b'varying HIGHPREC vec2 v_vTexcoord;\nvarying LOWPREC vec4 v_vColour;\n'
+        b'void main() { gl_FragColor = v_vColour; }\n\x00',
+        b'varying LOWPREC vec4 v_vColour;\nvarying float v_fFog;\n'
+        b'void main() { gl_FragColor = v_vColour; }\n\x00',
+        b'\xff' * 16,
+    ]
+    return b''.join(parts)
+
+
+def _make_fake_game_win(shaders: list[tuple[bytes, bytes, bytes]]) -> bytes:
+    """Build a valid IFF FORM container with a SHDR and STRG chunk holding `shaders`."""
+    # Layout after 8-byte FORM header:
+    #   chunk SHDR (8-byte hdr + count + ptrs + 16-byte entries)
+    #   chunk STRG (8-byte hdr + length-prefixed strings)
+    count = len(shaders)
+    shdr_data_len = 4 + count * 4 + count * 16
+    shdr_chunk_start = 8
+    shdr_entries_start = shdr_chunk_start + 8 + 4 + count * 4
+    strg_chunk_start = shdr_chunk_start + 8 + shdr_data_len
+    str_cursor = strg_chunk_start + 8
+
+    str_blobs: list[bytes] = []
+    entry_tuples: list[tuple[int, int, int, int]] = []
+    for name_b, vs_b, fs_b in shaders:
+        ptrs = []
+        for s in (name_b, vs_b, fs_b):
+            blob = struct.pack('<I', len(s)) + s + b'\x00'
+            str_ptr = str_cursor + 4
+            ptrs.append(str_ptr)
+            str_blobs.append(blob)
+            str_cursor += len(blob)
+        entry_tuples.append((ptrs[0], 0x80000001, ptrs[1], ptrs[2]))
+
+    strg_payload = b''.join(str_blobs)
+    entry_ptrs = [shdr_entries_start + i * 16 for i in range(count)]
+    shdr_payload = (
+        struct.pack(f'<I{count}I', count, *entry_ptrs)
+        + b''.join(struct.pack('<4I', *t) for t in entry_tuples)
+    )
+    body = (
+        b'SHDR' + struct.pack('<I', len(shdr_payload)) + shdr_payload
+        + b'STRG' + struct.pack('<I', len(strg_payload)) + strg_payload
+    )
+    return b'FORM' + struct.pack('<I', len(body)) + body
+
+
+class GMShadersAndCaptureReuseTest(unittest.TestCase):
+    """Tests for `gm_shaders.py` and `driver.py` capture reuse/reconstruction."""
+
+    def test_gm_shaders_reconstructs_48_builtins_and_shdr_custom_shaders(self) -> None:
+        from nspb_qt.win import gm_shaders
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            main_path = root / 'main'
+            main_path.write_bytes(_make_fake_gm_main())
+            rom_dir = root / 'RomFS'
+            rom_dir.mkdir()
+            custom_vs = b'#define _YY_GLSLES_ 1\nattribute vec3 pos;\nvoid main() {}\n'
+            custom_fs = b'#define _YY_GLSLES_ 1\nprecision mediump float;\nvoid main() {}\n'
+            (rom_dir / 'game.win').write_bytes(
+                _make_fake_game_win([(b'shd_custom', custom_vs, custom_fs)])
+            )
+
+            # Generate first without a table to collect the exact 50 keys (48 built-in + 2 custom)
+            out1 = root / 'out1'
+            res1 = gm_shaders.generate(main_path, rom_dir, out1, log=lambda _s: None)
+            self.assertIsNotNone(res1)
+            made1, want1 = res1
+            self.assertIsNone(want1)
+            self.assertEqual(len(made1), 50)
+            self.assertIn(f'{gm_shaders.key_bytes(custom_vs)}.vert', made1)
+            self.assertIn(f'{gm_shaders.key_bytes(custom_fs)}.frag', made1)
+
+            # Verify table completeness check passes when every key in gl_capture.tsv is present
+            tsv = root / 'gl_capture.tsv'
+            tsv.write_text('\n'.join(sorted(made1)) + '\n', encoding='utf-8')
+            out2 = root / 'out2'
+            res2 = gm_shaders.generate(
+                main_path, rom_dir, out2, tsv, log=lambda _s: None, require_table=True
+            )
+            self.assertIsNotNone(res2)
+            self.assertEqual(len(list(out2.glob('*'))), 50)
+
+    def test_gm_shaders_returns_none_and_writes_no_files_when_incomplete_or_non_gm(self) -> None:
+        from nspb_qt.win import gm_shaders
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            non_gm = root / 'plain_main'
+            non_gm.write_bytes(b'not a gamemaker binary')
+            rom_dir = root / 'RomFS'
+            rom_dir.mkdir()
+            (rom_dir / 'game.win').write_bytes(_make_fake_game_win([]))
+            out = root / 'out_non_gm'
+            self.assertIsNone(gm_shaders.generate(non_gm, rom_dir, out, log=lambda _s: None))
+            self.assertFalse(out.exists())
+
+            gm_main = root / 'gm_main'
+            gm_main.write_bytes(_make_fake_gm_main())
+            # require_table=True without a table must return None and leave out uncreated
+            self.assertIsNone(
+                gm_shaders.generate(gm_main, rom_dir, out, None, log=lambda _s: None, require_table=True)
+            )
+            self.assertFalse(out.exists())
+
+            # A table listing an unknown hash must return None and not write partial files
+            bad_tsv = root / 'bad.tsv'
+            bad_tsv.write_text('deadbeefcafebabe.vert\n', encoding='utf-8')
+            self.assertIsNone(
+                gm_shaders.generate(gm_main, rom_dir, out, bad_tsv, log=lambda _s: None, require_table=True)
+            )
+            self.assertFalse(out.exists())
+
+    def test_gm_shaders_rejects_corrupted_form_and_shdr_bounds(self) -> None:
+        from nspb_qt.win import gm_shaders
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bad = root / 'game.win'
+
+            # 1. File shorter than 8 bytes
+            bad.write_bytes(b'FORM')
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.shdr_chunk_shaders(bad)
+
+            # 2. FORM size larger than file
+            bad.write_bytes(b'FORM' + struct.pack('<I', 0x1000))
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.shdr_chunk_shaders(bad)
+
+            # 3. Chunk size exceeds FORM boundary
+            bad.write_bytes(b'FORM' + struct.pack('<I', 8) + b'SHDR' + struct.pack('<I', 0x100))
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.shdr_chunk_shaders(bad)
+
+            # 4. SHDR entry count exceeds chunk size
+            shdr = struct.pack('<I', 100)
+            body = b'SHDR' + struct.pack('<I', len(shdr)) + shdr
+            bad.write_bytes(b'FORM' + struct.pack('<I', len(body)) + body)
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.shdr_chunk_shaders(bad)
+
+            # 5. Out-of-bounds string pointer inside SHDR entry
+            shdr = struct.pack('<II4I', 1, 16, 0xFFFFFFF0, 0x80000001, 0xFFFFFFF0, 0xFFFFFFF0)
+            body = b'SHDR' + struct.pack('<I', len(shdr)) + shdr
+            bad.write_bytes(b'FORM' + struct.pack('<I', len(body)) + body)
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.shdr_chunk_shaders(bad)
+
+    def test_driver_capture_hooks_reconstruct_and_reuse(self) -> None:
+        from nspb_qt.win import driver, gm_shaders
+
+        repo = QT.parent / 'engine'
+        if not (repo / 'scripts/build_ipa_from_nsp.py').is_file():
+            self.skipTest('engine/ is missing: run python3 tools/engine.py sync')
+        mod = driver.load_upstream(repo)
+        driver.patch(mod, repo)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ver_dir = root / 'v0'
+            (ver_dir / 'ExeFS').mkdir(parents=True)
+            (ver_dir / 'RomFS').mkdir(parents=True)
+            (ver_dir / 'ExeFS' / 'main').write_bytes(_make_fake_gm_main())
+            custom_vs = b'#define _YY_GLSLES_ 1\nvoid main() {}\n'
+            custom_fs = b'#define _YY_GLSLES_ 1\nprecision lowp float;\nvoid main() {}\n'
+            (ver_dir / 'RomFS' / 'game.win').write_bytes(
+                _make_fake_game_win([(b's0', custom_vs, custom_fs)])
+            )
+
+            tsv_path = root / 'gl_capture.tsv'
+            tsv_path.write_text(
+                f'{gm_shaders.key_bytes(custom_vs)}.vert\n{gm_shaders.key_bytes(custom_fs)}.frag\n',
+                encoding='utf-8',
+            )
+
+            class FakeProfile:
+                id = '0100217023F6C000'
+
+                def table(self, name):
+                    if name == 'gl_capture.tsv':
+                        return tsv_path
+                    if name == 'vk_capture.tsv':
+                        return root / 'vk_capture.tsv'
+                    if name == 'shader_map.tsv':
+                        return root / 'shader_map.tsv'
+                    raise FileNotFoundError(name)
+
+                def get(self, key, default=''):
+                    return default
+
+            prof = FakeProfile()
+            # 1. Offline GameMaker GL reconstruction via mod.capture_shaders
+            cap_out = mod.capture_shaders(repo, ver_dir, None, root, {}, root, prof, 'gl')
+            self.assertEqual(cap_out, ver_dir / 'gl_capture')
+            self.assertTrue((cap_out / f'{gm_shaders.key_bytes(custom_vs)}.vert').is_file())
+
+            # 2. Reusing an already-populated vk_capture folder
+            (root / 'vk_capture.tsv').write_text('0123456789abcdef\n', encoding='utf-8')
+            vk_dir = ver_dir / 'vk_capture'
+            vk_dir.mkdir(parents=True)
+            (vk_dir / '0123456789abcdef.spv').write_bytes(b'spv')
+            vk_out = mod.capture_shaders(repo, ver_dir, None, root, {}, root, prof, 'vk')
+            self.assertEqual(vk_out, vk_dir)
+
+            # 3. Reusing a complete glslc_capture folder vs refusing when missing
+            sh_Name = 'fedcba9876543210.glslc'
+            (root / 'shader_map.tsv').write_text(
+                f'0\t1\t2\t3\t/glslc_capture/{sh_Name}#GLSLC@0\n', encoding='utf-8'
+            )
+            with self.assertRaises(mod.BuildError):
+                mod.capture_glslc(repo, {'v0': ver_dir}, 'v0', None, root, {}, root, prof)
+            glslc_dir = ver_dir / 'glslc_capture'
+            glslc_dir.mkdir(parents=True)
+            # GLSLC magic 0x19866891 at +0, total size 0x80 at +0x44
+            blob = bytearray(0x80)
+            struct.pack_into('<I', blob, 0, 0x19866891)
+            struct.pack_into('<I', blob, 0x44, 0x80)
+            (glslc_dir / sh_Name).write_bytes(bytes(blob))
+            self.assertIsNone(
+                mod.capture_glslc(repo, {'v0': ver_dir}, 'v0', None, root, {}, root, prof)
+            )
+
+            # 4. capture_jit returns Path(d) / 'jit' when jit.img exists, or packs from jit_capture/
+            jit_dir = ver_dir / 'jit'
+            jit_dir.mkdir(parents=True)
+            (jit_dir / 'jit.img').write_bytes(b'JIT')
+            self.assertEqual(
+                mod.capture_jit(sys.executable, repo, ver_dir, None, root, {}, root, prof),
+                jit_dir,
+            )
+            mod.rmtree(jit_dir)
+            caps_dir = ver_dir / 'jit_capture'
+            for bname in ('boot1', 'boot2'):
+                (caps_dir / bname).mkdir(parents=True)
+                (caps_dir / bname / '0.jit').write_bytes(b'J')
+            patched_dir = root / 'patched_v0'
+            patched_dir.mkdir()
+            (caps_dir / 'stamp.json').write_text(mod.jit_stamp(patched_dir, prof), encoding='utf-8')
+            ran_jit_cmd: list[list[str]] = []
+
+            def fake_jit_run(cmd, log, **_kw):
+                ran_jit_cmd.append([str(c) for c in cmd])
+                out_tmp = Path(cmd[-1])
+                out_tmp.mkdir(parents=True, exist_ok=True)
+                (out_tmp / 'jit.img').write_bytes(b'PACKED_JIT')
+                return 0
+
+            orig_run = mod.run
+            try:
+                mod.run = fake_jit_run
+                packed_jit = mod.capture_jit(
+                    sys.executable, repo, ver_dir, patched_dir, root, {}, root, prof
+                )
+            finally:
+                mod.run = orig_run
+            self.assertEqual(packed_jit, jit_dir)
+            self.assertEqual((jit_dir / 'jit.img').read_bytes(), b'PACKED_JIT')
+            self.assertEqual(len(ran_jit_cmd), 1)
+            self.assertTrue(ran_jit_cmd[0][1].endswith('dm/tools/jit_capture.py'))
+
+            # 5. capture_nro returns profile when missing.tsv is absent or empty, refuses when non-empty
+            nro_dir = root / 'nro_v0'
+            nro_dir.mkdir()
+            self.assertIs(
+                mod.capture_nro(sys.executable, repo, None, None, nro_dir, {}, root, prof, False),
+                prof,
+            )
+            (nro_dir / 'missing.tsv').write_text('', encoding='utf-8')
+            self.assertIs(
+                mod.capture_nro(sys.executable, repo, None, None, nro_dir, {}, root, prof, False),
+                prof,
+            )
+            (nro_dir / 'missing.tsv').write_text('deadbeef\tnro0\n', encoding='utf-8')
+            with self.assertRaises(mod.BuildError):
+                mod.capture_nro(sys.executable, repo, None, None, nro_dir, {}, root, prof, False)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
