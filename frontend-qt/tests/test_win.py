@@ -4632,5 +4632,388 @@ class WinToolchainInstallWiringTest(unittest.TestCase):
                 self.assertEqual(cenv.get('PYTHONPATH'), r'C:\UserLib')
 
 
+class WindowsDefenderExclusionsTest(unittest.TestCase):
+    """End-to-end unit tests for nspb_qt.win.defender and Model's Defender integration.
+
+    Runs on all platforms with or without PySide6 installed.
+    """
+
+    def setUp(self) -> None:
+        from nspb_qt.win import defender
+        self.defender = defender
+        self.defender._STATE_CACHE = None
+
+    def tearDown(self) -> None:
+        self.defender._STATE_CACHE = None
+
+    def test_safe_exclusion_dir_refuses_roots_system_and_broad_profile_folders(self) -> None:
+        d = self.defender
+        for unsafe in (
+            '',
+            '   ',
+            '/',
+            'C:',
+            'C:\\',
+            'D:\\',
+            'D:/',
+            r'\\server\share',
+            r'\\server\share\\',
+            r'C:\Windows',
+            r'C:\Windows\System32',
+            r'C:\Windows\Temp',
+            r'C:\Program Files',
+            r'C:\Program Files (x86)',
+            r'C:\ProgramData',
+            r'C:\Users',
+            r'C:\Users\Public',
+            r'C:\Users\Alice',
+            r'C:\Users\Alice\Desktop',
+            r'C:\Users\Alice\Downloads',
+            r'C:\Users\Alice\Documents',
+            r'C:\Users\Alice\AppData',
+            r'C:\Users\Alice\AppData\Local',
+            r'C:\Users\Alice\AppData\Roaming',
+            r'C:\Users\Alice\AppData\LocalLow',
+            r'C:\Users\Alice\AppData\Local\Temp',
+            str(Path.home()),
+            str(Path.home() / 'Downloads'),
+            str(Path.home() / 'Desktop'),
+            str(Path.home() / 'Documents'),
+        ):
+            self.assertFalse(
+                d.is_safe_exclusion_dir(unsafe),
+                f'expected unsafe directory to be refused: {unsafe!r}',
+            )
+
+        for safe in (
+            r'C:\Users\Alice\AppData\Local\NS Port Builder',
+            r'C:\Users\Alice\Downloads\01007ef00011e000_build',
+            r'C:\Users\Alice\Desktop\010015100b514000_build',
+            r'D:\SwitchGames',
+            r"E:\Games\塞尔达传说 O'Brien $100",
+        ):
+            self.assertTrue(
+                d.is_safe_exclusion_dir(safe),
+                f'expected specific build/game directory to be allowed: {safe!r}',
+            )
+
+    def test_collect_exclusions_and_status_lifecycle_with_cache_invalidation(self) -> None:
+        d = self.defender
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_appdata = root / 'AppData' / 'Local' / 'NS Port Builder'
+            fake_tools = fake_appdata / 'tools'
+            fake_tools.mkdir(parents=True)
+
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools):
+                # 1. When base_dir is broad Downloads, base_dir is skipped while specific work_dir is kept.
+                #    When games_folder covers work_dir, the child work_dir is deduplicated under games_folder.
+                folders, procs = d.collect_exclusions(
+                    games_folder=r'D:\SwitchGames',
+                    base_dir=r'C:\Users\Alice\Downloads',
+                    work_dir=r'C:\Users\Alice\Downloads\01007ef00011e000_build',
+                    out_dir=r'D:\SwitchGames\out',
+                )
+                norm_keys = {d._norm_key(p) for p in folders}
+                self.assertIn(d._norm_key(fake_appdata), norm_keys)
+                self.assertIn(d._norm_key(r'D:\SwitchGames'), norm_keys)
+                self.assertIn(d._norm_key(r'C:\Users\Alice\Downloads\01007ef00011e000_build'), norm_keys)
+                self.assertNotIn(d._norm_key(r'C:\Users\Alice\Downloads'), norm_keys)
+                # D:\SwitchGames\out is already covered by parent D:\SwitchGames
+                self.assertNotIn(d._norm_key(r'D:\SwitchGames\out'), norm_keys)
+                self.assertGreaterEqual(len(procs), 16)
+                for req_proc in ('dmsh_xlate.exe', 'spirv-cross.exe', 'metal.exe', 'air-lld.exe', 'metallib.exe', 'clang.exe'):
+                    self.assertIn(req_proc, procs)
+
+                # 2. Status transitions: needed -> ready -> partial -> ready
+                st0, f0, p0 = d.exclusions_status(games_folder=r'D:\SwitchGames')
+                self.assertEqual(st0, 'needed')
+
+                d.save_recorded_state(f0, p0)
+                st1, _, _ = d.exclusions_status(
+                    games_folder=r'D:\SwitchGames',
+                    work_dir=r'D:\SwitchGames\01007ef00011e000_build',
+                )
+                self.assertEqual(st1, 'ready', 'child work_dir under excluded games_folder must be ready')
+
+                st2, f2, p2 = d.exclusions_status(
+                    games_folder=r'D:\SwitchGames',
+                    out_dir=r'E:\NewOutputFolder',
+                )
+                self.assertEqual(st2, 'partial', 'newly added uncovered out_dir must report partial')
+
+                d.save_recorded_state(f2, p2)
+                st3, _, _ = d.exclusions_status(
+                    games_folder=r'D:\SwitchGames',
+                    out_dir=r'E:\NewOutputFolder',
+                )
+                self.assertEqual(st3, 'ready')
+
+                # 3. External modification of defender_exclusions.json invalidates _STATE_CACHE via (path, size, mtime)
+                st_file = d.state_file_path()
+                st_file.write_text('{"paths": [], "processes": []}', encoding='utf-8')
+                st4, _, _ = d.exclusions_status(games_folder=r'D:\SwitchGames')
+                self.assertEqual(st4, 'needed')
+
+    def test_apply_exclusions_powershell_encoding_uac_cancel_and_result_verification(self) -> None:
+        import base64
+        import re
+        d = self.defender
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_tools = root / 'NS Port Builder' / 'tools'
+            fake_tools.mkdir(parents=True)
+            tricky_dir = r"D:\Switch 游戏\Zelda O'Brien $HOME"
+
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools):
+                folders, procs = d.collect_exclusions(games_folder=tricky_dir)
+
+                def extract_payload(cmd: list[str]) -> tuple[str, str, dict]:
+                    self.assertEqual(cmd[0], 'powershell.exe')
+                    outer_b64 = cmd[cmd.index('-EncodedCommand') + 1]
+                    outer_ps = base64.b64decode(outer_b64).decode('utf-16-le')
+                    self.assertIn('-Verb RunAs', outer_ps)
+                    m_inner = re.search(r"'-EncodedCommand',\s*'([A-Za-z0-9+/=]+)'", outer_ps)
+                    self.assertIsNotNone(m_inner)
+                    inner_ps = base64.b64decode(m_inner.group(1)).decode('utf-16-le')
+                    self.assertIn('Add-MpPreference -ExclusionPath', inner_ps)
+                    self.assertIn('Add-MpPreference -ExclusionProcess', inner_ps)
+                    m_path = re.search(r"\$payloadPath = '([^']+(?:''[^']+)*)'", inner_ps)
+                    self.assertIsNotNone(m_path)
+                    payload_path = Path(m_path.group(1).replace("''", "'"))
+                    payload = json.loads(payload_path.read_text(encoding='utf-8'))
+                    return outer_ps, inner_ps, payload
+
+                # Case A: UAC cancelled by user (exit code 1223) -> cancelled=True, state NOT saved
+                def runner_uac_cancelled(cmd, **_kw):
+                    _outer, _inner, payload = extract_payload(cmd)
+                    self.assertIn(d._norm_win_path(tricky_dir), payload['paths'])
+                    return subprocess.CompletedProcess(cmd, d.ERROR_CANCELLED, '', '')
+
+                res_cancel = d.apply_exclusions(folders, procs, runner=runner_uac_cancelled)
+                self.assertFalse(res_cancel.ok)
+                self.assertTrue(res_cancel.cancelled)
+                self.assertFalse(d.state_file_path().exists(), 'cancelled UAC must not record state')
+
+                # Case B: Process exits 0 WITHOUT writing result.json -> must be rejected (no false positive)
+                def runner_no_result_file(cmd, **_kw):
+                    extract_payload(cmd)
+                    return subprocess.CompletedProcess(cmd, 0, '', '')
+
+                res_no_file = d.apply_exclusions(folders, procs, runner=runner_no_result_file)
+                self.assertFalse(res_no_file.ok)
+                self.assertFalse(res_no_file.cancelled)
+                self.assertIn('without writing result.json', res_no_file.error)
+                self.assertFalse(d.state_file_path().exists())
+
+                # Case C: Inner script writes ok=False in result.json -> must report failure even if returncode is 0
+                def runner_inner_error(cmd, **_kw):
+                    _outer, _inner, payload = extract_payload(cmd)
+                    Path(payload['result_path']).write_text(
+                        json.dumps({'ok': False, 'error': 'Tamper Protection blocked exclusion'}),
+                        encoding='utf-8',
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, '', '')
+
+                res_err = d.apply_exclusions(folders, procs, runner=runner_inner_error)
+                self.assertFalse(res_err.ok)
+                self.assertIn('Tamper Protection blocked exclusion', res_err.error)
+                self.assertFalse(d.state_file_path().exists())
+
+                # Case D: Elevated PowerShell succeeds and writes ok=True in result.json -> recorded and ready
+                seen_result_parent: list[Path] = []
+
+                def runner_ok(cmd, **_kw):
+                    _outer, _inner, payload = extract_payload(cmd)
+                    r_path = Path(payload['result_path'])
+                    seen_result_parent.append(r_path.parent)
+                    r_path.write_text(json.dumps({'ok': True, 'error': ''}), encoding='utf-8')
+                    return subprocess.CompletedProcess(cmd, 0, '', '')
+
+                res_ok = d.apply_exclusions(folders, procs, runner=runner_ok)
+                self.assertTrue(res_ok.ok)
+                self.assertFalse(res_ok.cancelled)
+                self.assertTrue(d.state_file_path().is_file())
+                self.assertFalse(seen_result_parent[0].exists(), 'temporary payload directory must be cleaned up')
+                st_after, _, _ = d.exclusions_status(games_folder=tricky_dir)
+                self.assertEqual(st_after, 'ready')
+
+    def test_model_defender_generation_guard_and_all_seven_languages(self) -> None:
+        import ast
+        from nspb_qt.i18n import Lang
+        from nspb_qt.l10n import t as l10n_t
+
+        # 1. Verify all 20 defender.* keys exist and format cleanly across all 7 languages
+        defender_keys = (
+            'defender.addBtn',
+            'defender.addingBtn',
+            'defender.msg.added',
+            'defender.msg.cancelled',
+            'defender.msg.failed',
+            'defender.msg.waiting',
+            'defender.note',
+            'defender.prompt.addAndBuild',
+            'defender.prompt.body',
+            'defender.prompt.dontAskAgain',
+            'defender.prompt.foldersHeader',
+            'defender.prompt.procsHeader',
+            'defender.prompt.skipOnce',
+            'defender.prompt.title',
+            'defender.status.needed',
+            'defender.status.partial',
+            'defender.status.ready',
+            'defender.summary',
+            'defender.title',
+            'defender.updateBtn',
+        )
+        for lg in Lang.all():
+            for key in defender_keys:
+                if key == 'defender.msg.added':
+                    val = l10n_t(key, lg, 3, 16)
+                elif key == 'defender.msg.failed':
+                    val = l10n_t(key, lg, 'access denied')
+                elif key == 'defender.summary':
+                    val = l10n_t(key, lg, r'D:\SwitchGames', 16)
+                else:
+                    val = l10n_t(key, lg)
+                self.assertTrue(val and val != key, f'missing translation for {key} in {lg.code}')
+                self.assertNotIn('%@', val, f'unformatted placeholder in {key} ({lg.code}): {val}')
+
+        # 2. Verify Model.apply_defender_exclusions generation guard prevents stale worker overwrite
+        src = (QT / 'nspb_qt' / 'model.py').read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        cls_node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Model')
+        wanted = {
+            '_current_build_dirs',
+            'defender_info',
+            'should_prompt_defender_before_build',
+            'apply_defender_exclusions',
+            '_invoke_defender_done',
+        }
+        methods = [n for n in cls_node.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+        mod_node = ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[]))
+
+        pending_workers: list = []
+
+        class _ManualThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    pending_workers.append(self._target)
+
+        class _Sig:
+            def emit(self):
+                pass
+
+        class _DummyQThread:
+            @staticmethod
+            def currentThread():
+                return 'main'
+
+        ns: dict = {
+            'Path': Path,
+            'Callable': object,
+            'Slot': lambda *a, **k: (lambda fn: fn),
+            'Q_ARG': lambda *_a: None,
+            'QThread': _DummyQThread,
+            'QMetaObject': type('QM', (), {'invokeMethod': staticmethod(lambda obj, name, *_a: getattr(obj, name)())}),
+            'Qt': type('Qt', (), {'QueuedConnection': 1}),
+            'threading': type('T', (), {'Thread': _ManualThread}),
+            'pu': type('PU', (), {'IS_WIN': True}),
+            '__package__': 'nspb_qt',
+        }
+        exec(compile(mod_node, str(QT / 'nspb_qt' / 'model.py'), 'exec'), ns)
+
+        class _Harness:
+            _current_build_dirs = ns['_current_build_dirs']
+            defender_info = ns['defender_info']
+            should_prompt_defender_before_build = ns['should_prompt_defender_before_build']
+            apply_defender_exclusions = ns['apply_defender_exclusions']
+            _invoke_defender_done = ns['_invoke_defender_done']
+            show_defender_ui = True
+            build_key = '01007EF00011E000'
+            repo_ok = False
+
+            def __init__(self):
+                import threading as real_th
+                self.lang = Lang('zh')
+                self.library = type('Lib', (), {'games_folder': r'D:\SwitchGames', 'games': []})()
+                self.out_dir = ''
+                self.base_path = ''
+                self.game_dir = ''
+                self.game_folder = None
+                self.shell_cache_path = r'D:\ShellCache'
+                self.repo_path = ''
+                self.defender_busy = False
+                self.defender_status_msg = ''
+                self.defender_status_ok = False
+                self._defender_gen = 0
+                self._defender_lock = real_th.RLock()
+                self._defender_callbacks = {}
+                self.repoChanged = _Sig()
+                self.depsChanged = _Sig()
+                self.logs: list[str] = []
+
+            def _emit_repo_changed(self) -> None:
+                self.repoChanged.emit()
+
+            def _emit_deps_changed(self) -> None:
+                self.depsChanged.emit()
+
+            def thread(self):
+                return 'main'
+
+            def log(self, msg: str) -> None:
+                self.logs.append(msg)
+
+            def t(self, key: str, *args: object) -> str:
+                return l10n_t(key, self.lang, *args)
+
+            def settings_value(self, _k: str, default=False):
+                return default
+
+        h = _Harness()
+        cb1_calls: list[tuple[bool, bool]] = []
+        cb2_calls: list[tuple[bool, bool]] = []
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_tools = Path(td) / 'NS Port Builder' / 'tools'
+            fake_tools.mkdir(parents=True)
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools):
+                self.assertTrue(h.should_prompt_defender_before_build())
+                h.apply_defender_exclusions(on_done=lambda ok, c, _m: cb1_calls.append((ok, c)))
+                self.assertEqual(len(pending_workers), 1)
+                w1 = pending_workers.pop(0)
+
+                # Simulate a second request superseding the first before w1 finishes
+                h.defender_busy = False
+                h.apply_defender_exclusions(on_done=lambda ok, c, _m: cb2_calls.append((ok, c)))
+                self.assertEqual(len(pending_workers), 1)
+                w2 = pending_workers.pop(0)
+
+                # w2 finishes first with success
+                with mock.patch.object(
+                    self.defender,
+                    'apply_exclusions',
+                    return_value=self.defender.DefenderResult(ok=True, added_paths=['a'], added_processes=['b']),
+                ):
+                    w2()
+                self.assertTrue(h.defender_status_ok)
+                self.assertEqual(cb2_calls, [(True, False)])
+
+                # Stale w1 finishes later with failure -> must NOT overwrite h.defender_status_ok or fire cb1
+                with mock.patch.object(
+                    self.defender,
+                    'apply_exclusions',
+                    return_value=self.defender.DefenderResult(ok=False, error='stale failure'),
+                ):
+                    w1()
+                self.assertTrue(h.defender_status_ok, 'stale worker generation must not overwrite newer state')
+                self.assertEqual(cb1_calls, [], 'superseded callback must not fire')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

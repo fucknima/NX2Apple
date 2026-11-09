@@ -867,9 +867,79 @@ class OnboardingDialog(QDialog):
             rl.addWidget(pick_btn)
             grp.add_row(r)
             self.body_layout.addWidget(grp)
+            append_def = getattr(self, '_append_defender_card', None)
+            if callable(append_def):
+                append_def()
 
         self.body_layout.addStretch(1)
         self._fit_dialog_height()
+
+    def _append_defender_card(self) -> None:
+        if not getattr(self.m, 'show_defender_ui', False):
+            return
+        state, folders, procs = self.m.defender_info()
+        busy = bool(getattr(self.m, 'defender_busy', False))
+        dot_color = style.GREEN if state == 'ready' else style.AMBER
+
+        grp = CardGroup()
+        r = QWidget()
+        rl = QHBoxLayout(r)
+        rl.setContentsMargins(18, 14, 18, 14)
+        rl.setSpacing(12)
+        rl.addWidget(StatusDot(dot_color))
+
+        col = QVBoxLayout()
+        col.setSpacing(3)
+        head_row = QHBoxLayout()
+        head_row.setSpacing(8)
+        title_lbl = QLabel(self.m.t('defender.title'))
+        title_lbl.setObjectName('rowTitle')
+        head_row.addWidget(title_lbl)
+        status_key = {
+            'ready': 'defender.status.ready',
+            'partial': 'defender.status.partial',
+        }.get(state, 'defender.status.needed')
+        st_lbl = QLabel(self.m.t(status_key))
+        st_lbl.setStyleSheet(
+            f'color: {style.GREEN if state == "ready" else style.AMBER}; font-size: 12px; font-weight: 600;'
+        )
+        head_row.addWidget(st_lbl)
+        head_row.addStretch(1)
+        col.addLayout(head_row)
+
+        summary_lbl = QLabel(self.m.t('defender.summary', ' · '.join(folders), len(procs)))
+        summary_lbl.setObjectName('mono')
+        summary_lbl.setWordWrap(True)
+        col.addWidget(summary_lbl)
+
+        note_lbl = QLabel(self.m.t('defender.note'))
+        note_lbl.setObjectName('muted')
+        note_lbl.setWordWrap(True)
+        col.addWidget(note_lbl)
+
+        status_msg = getattr(self.m, 'defender_status_msg', '')
+        if status_msg:
+            msg_ok = bool(getattr(self.m, 'defender_status_ok', False))
+            msg_lbl = QLabel(status_msg)
+            msg_lbl.setWordWrap(True)
+            msg_lbl.setStyleSheet(f'color: {style.GREEN if msg_ok else style.AMBER}; font-size: 12px;')
+            col.addWidget(msg_lbl)
+
+        rl.addLayout(col, 1)
+
+        btn_text = (
+            self.m.t('defender.addingBtn')
+            if busy
+            else self.m.t('defender.updateBtn' if state == 'ready' else 'defender.addBtn')
+        )
+        act_btn = QPushButton(btn_text)
+        if state != 'ready' and not busy:
+            act_btn.setObjectName('creamPill')
+        act_btn.setEnabled(not busy)
+        act_btn.clicked.connect(lambda: self.m.apply_defender_exclusions())
+        rl.addWidget(act_btn)
+        grp.add_row(r)
+        self.body_layout.addWidget(grp)
 
     def _fit_dialog_height(self) -> None:
         if self.body_host.isVisible():
@@ -921,3 +991,115 @@ class OnboardingDialog(QDialog):
         else:
             self.m.settings_set('onboardingComplete', True)
             self.accept()
+
+
+class DefenderPromptDialog(QDialog):
+    """Pre-build confirmation dialog offering one-click Windows Defender exclusions."""
+
+    def __init__(
+        self,
+        model: 'Model',
+        *,
+        title_id: str | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.m = model
+        self.title_id = title_id
+        self.choice = 'cancel'
+        self.setWindowTitle(self.m.t('defender.prompt.title'))
+        self.setMinimumSize(600, 400)
+        self.setStyleSheet(style.STYLESHEET)
+
+        _state, folders, procs = self.m.defender_info(title_id=title_id)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(28, 24, 28, 22)
+        lay.setSpacing(14)
+
+        title = QLabel(self.m.t('defender.prompt.title'))
+        title.setStyleSheet('font-size: 22px; font-weight: 800;')
+        title.setWordWrap(True)
+        lay.addWidget(title)
+
+        body = QLabel(self.m.t('defender.prompt.body'))
+        body.setObjectName('muted')
+        body.setWordWrap(True)
+        lay.addWidget(body)
+
+        grp = CardGroup()
+        r_dirs = QWidget()
+        v_dirs = QVBoxLayout(r_dirs)
+        v_dirs.setContentsMargins(18, 12, 18, 12)
+        v_dirs.setSpacing(4)
+        fh = QLabel(self.m.t('defender.prompt.foldersHeader'))
+        fh.setObjectName('rowTitle')
+        v_dirs.addWidget(fh)
+        for folder in folders:
+            fl = QLabel(f'• {folder}')
+            fl.setObjectName('mono')
+            fl.setWordWrap(True)
+            v_dirs.addWidget(fl)
+        grp.add_row(r_dirs)
+        grp.add_divider()
+
+        r_procs = QWidget()
+        v_procs = QVBoxLayout(r_procs)
+        v_procs.setContentsMargins(18, 12, 18, 12)
+        v_procs.setSpacing(4)
+        ph = QLabel(self.m.t('defender.prompt.procsHeader'))
+        ph.setObjectName('rowTitle')
+        v_procs.addWidget(ph)
+        proc_names = [p.replace('\\', '/').rsplit('/', 1)[-1] for p in procs]
+        pl = QLabel(', '.join(proc_names))
+        pl.setObjectName('mono')
+        pl.setWordWrap(True)
+        v_procs.addWidget(pl)
+        grp.add_row(r_procs)
+        lay.addWidget(grp)
+
+        dont_ask_row = QHBoxLayout()
+        dont_ask_row.setContentsMargins(2, 2, 2, 0)
+        dont_ask_row.setSpacing(10)
+        self.dont_ask_switch = LauncherSwitch(False)
+        dont_ask_row.addWidget(self.dont_ask_switch)
+        self.dont_ask_lbl = QLabel(self.m.t('defender.prompt.dontAskAgain'))
+        self.dont_ask_lbl.setObjectName('muted')
+        self.dont_ask_lbl.setWordWrap(True)
+        dont_ask_row.addWidget(self.dont_ask_lbl, 1)
+        lay.addLayout(dont_ask_row)
+
+        lay.addStretch(1)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(10)
+        foot.addStretch(1)
+
+        self.skip_btn = QPushButton(self.m.t('defender.prompt.skipOnce').replace('&', '&&'))
+        self.skip_btn.clicked.connect(self._on_skip)
+        foot.addWidget(self.skip_btn)
+
+        self.add_btn = QPushButton(self.m.t('defender.prompt.addAndBuild').replace('&', '&&'))
+        self.add_btn.setObjectName('creamPill')
+        self.add_btn.clicked.connect(self._on_add)
+        foot.addWidget(self.add_btn)
+        lay.addLayout(foot)
+
+        lay.activate()
+        hint_h = max(440, self.sizeHint().height() + 12)
+        self.resize(660, hint_h)
+
+    def _save_dont_ask(self) -> None:
+        if self.dont_ask_switch.isChecked():
+            self.m.settings_set('defenderPromptDismissed', True)
+
+    def _on_skip(self) -> None:
+        self._save_dont_ask()
+        self.choice = 'skip'
+        self.accept()
+
+    def _on_add(self) -> None:
+        self._save_dont_ask()
+        self.choice = 'add'
+        self.accept()
+

@@ -1366,10 +1366,13 @@ class ParityWindowTests(unittest.TestCase):
         self._p_qsettings = mock.patch.object(
             model_mod, 'QSettings', side_effect=lambda *a, **kw: QSettings(ini_file, QSettings.IniFormat)
         )
+        self._p_check_deps = mock.patch.object(model_mod.Model, 'check_deps', lambda _self: None)
         self._p_state.start()
         self._p_qsettings.start()
+        self._p_check_deps.start()
 
     def tearDown(self) -> None:
+        self._p_check_deps.stop()
         self._p_qsettings.stop()
         self._p_state.stop()
         self._state_tmp.cleanup()
@@ -2300,6 +2303,118 @@ class ParityWindowTests(unittest.TestCase):
             hero.deleteLater()
             self.app.sendPostedEvents(None, QEvent.DeferredDelete)
             self.app.processEvents()
+
+    def test_windows_defender_exclusions_ui_and_pre_build_prompt_across_all_languages(self) -> None:
+        """Verify Settings -> Build Tools Defender row, OnboardingDialog Step 3 Defender card,
+        and DefenderPromptDialog pre-build flow across all 7 languages.
+        """
+        import time
+        from unittest import mock
+        from nspb_qt.model import Dep, DepState, Model
+        from nspb_qt.sheets import DefenderPromptDialog, OnboardingDialog
+        from nspb_qt.ui import MainWindow
+        from nspb_qt.win import defender as wdef, toolchain as tc
+
+        root = Path(self._state_tmp.name)
+        fake_tools = root / 'NS Port Builder' / 'tools'
+        fake_tools.mkdir(parents=True)
+        games_dir = root / 'SwitchGames'
+        games_dir.mkdir()
+        wdef._STATE_CACHE = None
+
+        with mock.patch.dict(os.environ, {'NSPB_SHOW_DEFENDER_ROW': '1'}, clear=False), \
+             mock.patch.object(tc, 'tools_dir', return_value=fake_tools), \
+             mock.patch.object(MainWindow, '_maybe_show_onboarding', lambda self: None):
+            m = Model()
+            m.deps = [Dep('python', 'dep.python', 'dep.python.hint', DepState.OK)]
+            m.deps_checked = True
+            m.library.games_folder = str(games_dir)
+            m.base_path = str(games_dir / 'Celeste [0100F7B00BB5C000][v0].nsp')
+            m.keys_path = str(games_dir / 'prod.keys')
+
+            w = MainWindow(m)
+            self.addCleanup(self._delete, m, w)
+            w._switch_page('settings')
+            w.show()
+            self.app.processEvents()
+
+            # 1. Settings -> Build Tools Defender row is visible and updates across all 7 languages
+            self.assertFalse(w.defender_row_widget.isHidden())
+            self.assertFalse(w.defender_div.isHidden())
+            for lg in Lang.all():
+                m.set_lang(lg)
+                self.app.processEvents()
+                self.assertEqual(w.defender_title_lbl.text(), m.t('defender.title'))
+                self.assertEqual(w.defender_badge_lbl.text(), m.t('defender.status.needed'))
+                self.assertEqual(w.defender_note_lbl.text(), m.t('defender.note'))
+                self.assertEqual(w.defender_btn.text(), m.t('defender.addBtn'))
+                self.assertIn(str(games_dir), w.defender_summary_lbl.text())
+
+            # 2. OnboardingDialog Step 3 renders the Defender card across languages
+            m.set_lang(Lang('zh'))
+            dlg = OnboardingDialog(m)
+            self.addCleanup(dlg.deleteLater)
+            dlg.step = 3
+            dlg._render_step()
+            self.app.processEvents()
+            self.assertEqual(dlg.body_layout.count(), 3)  # Games card + Defender card + stretch
+
+            # 3. Pre-build prompt: user cancels UAC -> build does NOT start
+            started: list[bool] = []
+            with mock.patch.object(m, 'start_build', side_effect=lambda *_a, **_kw: started.append(True)):
+                def choose_add(prompt_self):
+                    prompt_self.choice = 'add'
+                    return 1
+
+                with mock.patch.object(DefenderPromptDialog, 'exec', choose_add), \
+                     mock.patch.object(
+                         wdef,
+                         'apply_exclusions',
+                         return_value=wdef.DefenderResult(ok=False, cancelled=True),
+                     ):
+                    w._build_clicked()
+                    for _ in range(50):
+                        self.app.processEvents()
+                        if not m.defender_busy:
+                            break
+                        time.sleep(0.01)
+                self.assertEqual(started, [], 'cancelling UAC must abort the build')
+                self.assertEqual(m.defender_status_msg, m.t('defender.msg.cancelled'))
+
+                # 4. Pre-build prompt: user clicks Add & Build and confirms UAC -> exclusions recorded & build starts
+                def fake_apply_ok(paths, procs, **_kw):
+                    wdef.save_recorded_state(paths, procs)
+                    return wdef.DefenderResult(ok=True, added_paths=list(paths), added_processes=list(procs))
+
+                with mock.patch.object(DefenderPromptDialog, 'exec', choose_add), \
+                     mock.patch.object(wdef, 'apply_exclusions', side_effect=fake_apply_ok):
+                    w._build_clicked()
+                    for _ in range(50):
+                        self.app.processEvents()
+                        if started:
+                            break
+                        time.sleep(0.01)
+                self.assertEqual(started, [True], 'confirming UAC in Add & Build must start the build')
+                self.assertEqual(w.defender_badge_lbl.text(), m.t('defender.status.ready'))
+                self.assertEqual(w.defender_btn.text(), m.t('defender.updateBtn'))
+
+                # 5. Subsequent build with ready exclusions starts immediately without prompting
+                started.clear()
+                with mock.patch.object(DefenderPromptDialog, 'exec', side_effect=AssertionError('must not prompt')):
+                    w._build_clicked()
+                self.assertEqual(started, [True])
+
+                # 6. DefenderPromptDialog "Skip + Don't ask again" persists defenderPromptDismissed
+                wdef._STATE_CACHE = None
+                if wdef.state_file_path().exists():
+                    wdef.state_file_path().unlink()
+                p_dlg = DefenderPromptDialog(m, parent=w)
+                self.addCleanup(p_dlg.deleteLater)
+                p_dlg.dont_ask_switch.setChecked(True)
+                p_dlg._on_skip()
+                self.assertEqual(p_dlg.choice, 'skip')
+                self.assertTrue(m.settings_value('defenderPromptDismissed', False))
+                self.assertFalse(m.should_prompt_defender_before_build())
 
 
 if __name__ == '__main__':
