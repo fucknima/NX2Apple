@@ -219,7 +219,7 @@ public enum GameCheats {
         }
         body = body.trimmingCharacters(in: .whitespaces)
         // The separator the engine accepts between the base and the half: a space, then any of - : _ ( [
-        guard let last = body.last, " -:_([".contains(last) else { return (name, nil) } }
+        guard let last = body.last, " -:_([".contains(last) else { return (name, nil) }
         let base = String(body.dropLast()).trimmingCharacters(in: .whitespaces)
         guard !base.isEmpty else { return (name, nil) }
         return (base, half)
