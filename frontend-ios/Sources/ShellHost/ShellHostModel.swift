@@ -256,10 +256,12 @@ public struct ShellHostConfig: Sendable {
         let fromShell = Set(profile.settings.filter(store.isFromShell).map(\.env))
         let pad = GamePadMapStore(defaults: config.defaults(entry.id))
         let sections = SettingsPresenter.sections(profile: profile, values: store.values(), fromShell: fromShell)
+        // The app's own cheat files, copied into the game's folder on first sight, then one switch per entry.
+        let cheatSections = GameCheats.sections(gameID: entry.id, appFolder: appFolder(for: entry.id))
         // A profile-provided DM_PAD_MAP row owns the mapping, so do not offer conflicting shell overrides.
         let padSections = profile.settings.contains { $0.env == "DM_PAD_MAP" } ? [] : [pad.section()]
         return GameDetail(
-            game: tile, sections: sections + padSections,
+            game: tile, sections: sections + cheatSections + padSections,
             dataSource: dataSource(data), dataNote: dataNote(data, found: data.found),
             cloudSaves: cloud, cloudNote: cloudNote, dlc: dlc(data), hasModifiedSettings: store.hasModifiedSettings || !pad.entries.isEmpty,
             dataFromShell: data.source == .shell, cloudFromShell: cloudFromShell,
@@ -321,6 +323,12 @@ public struct ShellHostConfig: Sendable {
     }
 
     public func change(_ id: String, setting: String, value: String) {
+        // A cheats switch is the player's own file under the game's folder, not a launcher setting.
+        if setting.hasPrefix(GameCheats.rowPrefix) {
+            GameCheats.toggle(rowID: setting, appFolder: appFolder(for: id))
+            refresh(id)
+            return
+        }
         guard let entry = entry(id), let profile = profile(for: entry) else { return }
         if setting.hasPrefix("pad.") {
             GamePadMapStore(defaults: config.defaults(id)).change(setting, value: value)

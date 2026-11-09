@@ -1,0 +1,99 @@
+# Build the unsigned iOS `DmShell.app` template with the fork's `frontend-ios` package.
+#
+# The template is what the Windows side (NS Port Builder) embeds each game's `DmGame<ID>.framework` into
+# when it exports `NX2Apple.ipa`. Building it here keeps the shell's SwiftUI screens on a macOS runner
+# while the game frameworks stay on the machine that owns the game data.
+#
+#   - push to main that touches the shell, the template script or this workflow → build + artifact
+#   - workflow_dispatch → build + artifact, optionally published as a release asset
+name: Build DmShell.app (iOS, unsigned)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend-ios/**'
+      - 'tools/build_shell_template.py'
+      - '.github/workflows/build-dmshell.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish DmShell.app as a release asset'
+        type: boolean
+        default: false
+      tag:
+        description: 'Release tag (empty: shell-<run number>)'
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dmshell-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build DmShell.app
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+          python3 --version
+          if ! command -v xcodegen >/dev/null; then brew install xcodegen; fi
+          xcodegen --version
+
+      - name: Sync the engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/engine.py -q sync
+
+      - name: Build the shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/build_shell_template.py --out "$RUNNER_TEMP/shell/DmShell.app"
+          du -sh "$RUNNER_TEMP/shell/DmShell.app"
+          # The cheats panel reads these; a build without them ships an empty panel.
+          test -d "$RUNNER_TEMP/shell/DmShell.app/ShellUI_ShellHost.bundle/cheats" \
+            || { echo "the shell bundle has no cheats folder"; find "$RUNNER_TEMP/shell/DmShell.app" -maxdepth 2 -type d; exit 1; }
+
+      - name: Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/shell"
+          ditto -c -k --sequesterRsrc --keepParent DmShell.app "DmShell-${{ github.run_number }}.zip"
+          ls -lh DmShell-*.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DmShell.app
+          path: ${{ runner.temp }}/shell/DmShell-*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish the release asset
+        if: ${{ inputs.publish }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="shell-${{ github.run_number }}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "DmShell.app $tag" --notes "Unsigned iOS shell template built from ${GITHUB_SHA}."
+          gh release upload "$tag" "$RUNNER_TEMP"/shell/DmShell-*.zip --clobber
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}" >> "$GITHUB_STEP_SUMMARY"

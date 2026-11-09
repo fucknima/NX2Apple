@@ -35,11 +35,13 @@ def _chain_version(engine: Path) -> str:
 def build_template(out_app: Path, engine: Path | None = None) -> Path:
     engine = (engine or (REPO / 'engine')).resolve()
     ios_src = engine / 'dm' / 'ios'
-    pkg_dir = engine / 'frontend-ios'
+    # The checkout's own package first: a fork that changes the shell (the cheats panel) must build what it ships,
+    # not whatever copy a synced engine carries.
+    pkg_dir = REPO / 'frontend-ios'
+    if not (pkg_dir / 'Package.swift').is_file():
+        pkg_dir = engine / 'frontend-ios'
     if not (pkg_dir / 'Package.swift').is_file():
         pkg_dir = engine.parent / 'frontend-ios'
-    if not (pkg_dir / 'Package.swift').is_file():
-        pkg_dir = REPO / 'frontend-ios'
     if not (ios_src / 'project-shell.yml').is_file():
         raise SystemExit(f'no {ios_src / "project-shell.yml"}: run `python3 tools/engine.py sync` first')
     if not (pkg_dir / 'Package.swift').is_file():
