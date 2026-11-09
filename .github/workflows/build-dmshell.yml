@@ -36,7 +36,11 @@ concurrency:
 jobs:
   build:
     name: Build DmShell.app
-    runs-on: macos-latest
+    # The Xcode 27 image the upstream workflows use: it compiles AppIcon.icon and carries iOS 27 SDK,
+    # which frontend-ios needs (its package floor is iOS 26).
+    runs-on: xcode-27
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
