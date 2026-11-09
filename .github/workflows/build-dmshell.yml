@@ -70,8 +70,8 @@ jobs:
           python3 tools/build_shell_template.py --out "$RUNNER_TEMP/shell/DmShell.app"
           du -sh "$RUNNER_TEMP/shell/DmShell.app"
           # The cheats panel reads these; a build without them ships an empty panel.
-          test -d "$RUNNER_TEMP/shell/DmShell.app/ShellUI_ShellHost.bundle/cheats" \
-            || { echo "the shell bundle has no cheats folder"; find "$RUNNER_TEMP/shell/DmShell.app" -maxdepth 2 -type d; exit 1; }
+          test -d "$RUNNER_TEMP/shell/DmShell.app/ShellUI_ShellHost.bundle/Cheats" \
+            || { echo "the shell bundle has no Cheats folder"; find "$RUNNER_TEMP/shell/DmShell.app" -maxdepth 2 -type d; exit 1; }
 
       - name: Pack
         shell: bash

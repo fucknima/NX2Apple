@@ -15,7 +15,7 @@ let package = Package(
     targets: [
         .target(name: "ShellUI", resources: [.process("Resources")]),
         .target(name: "ShellControllers", dependencies: ["ShellUI"]),
-        .target(name: "ShellHost", dependencies: ["ShellUI", "ShellControllers"], resources: [.process("Resources")]),
+        .target(name: "ShellHost", dependencies: ["ShellUI", "ShellControllers"], resources: [.process("Resources"), .copy("Cheats")]),
         .executableTarget(name: "ShellDemo", dependencies: ["ShellUI", "ShellControllers", "ShellHost"], resources: [.process("Resources")]),
         .testTarget(name: "ShellUITests", dependencies: ["ShellUI"]),
         .testTarget(name: "ShellHostTests", dependencies: ["ShellHost", "ShellUI", "ShellControllers"], resources: [.copy("Fixtures")]),

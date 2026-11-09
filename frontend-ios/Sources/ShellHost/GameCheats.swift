@@ -227,10 +227,11 @@ public enum GameCheats {
 
     // MARK: - Bundled files
 
-    /// The `.txt` files the app ships for `gameID`, from `ShellHost`'s resource bundle.
+    /// The `.txt` files the app ships for `gameID`, from `ShellHost`'s resource bundle. `Package.swift` copies the
+    /// `Cheats` folder whole (`.copy`), so the per-game folders keep their shape.
     private static func shippedFiles(gameID: String, bundle: Bundle) -> [URL] {
         guard let root = bundle.resourceURL else { return [] }
-        let dir = root.appendingPathComponent("cheats", isDirectory: true).appendingPathComponent(gameID, isDirectory: true)
+        let dir = root.appendingPathComponent("Cheats", isDirectory: true).appendingPathComponent(gameID, isDirectory: true)
         let names = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
         let found = names.filter { $0.pathExtension.lowercased() == "txt" }
         if !found.isEmpty { return found }
