@@ -1762,7 +1762,8 @@ class PlatformIsolationTest(unittest.TestCase):
             code = (
                 'import sys; sys.path.insert(0, %r)\n'
                 'from nspb_qt.win import toolchain, sdk_fetch, shim, fix_ipa_modes, fetch, '
-                'doctor, build_app, driver, xcrun_shim, macho_sign, sdk_auto_cuts\n'
+                'doctor, build_app, driver, xcrun_shim, macho_sign, sdk_auto_cuts, '
+                'arm64_emu, glslc_emu\n'
                 'print("ok")\n'
             ) % str(QT)
             r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
